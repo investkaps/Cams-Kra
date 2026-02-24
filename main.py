@@ -14,10 +14,9 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
 from dotenv import load_dotenv
 
-# ================= INIT =================
+# ================= LOAD ENV =================
 
 load_dotenv()
-app = FastAPI(title="CAMS PAN Download API")
 
 TOKEN_URL = "https://camskra.com/restAuth/api/v1/getToken"
 PAN_DOWNLOAD_URL = "https://camskra.com/CAMSWS_KRA/KRA_API/PANdownload"
@@ -27,12 +26,31 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 SECRET_KEY = os.getenv("SECRET_KEY")
 API_KEY = os.getenv("API_KEY")
 
-ENC_DEC_KEY: Optional[bytes] = None
-IV_KEY: Optional[bytes] = None
+enc_key = os.getenv("ENC_DEC_KEY")
+iv_key = os.getenv("IV_KEY")
+
+if not all([CLIENT_CODE, CLIENT_ID, SECRET_KEY, API_KEY, enc_key, iv_key]):
+    raise RuntimeError("Missing required environment variables")
+
+# Decode encryption keys
+ENC_DEC_KEY = base64.b64decode(enc_key)
+IV_KEY = base64.b64decode(iv_key)
+
+# Validate key sizes
+if len(ENC_DEC_KEY) != 32:
+    raise RuntimeError("ENC_DEC_KEY must decode to 32 bytes (AES-256)")
+
+if len(IV_KEY) != 16:
+    raise RuntimeError("IV_KEY must decode to 16 bytes")
+
+# ================= TOKEN CACHE =================
 
 cached_token: Optional[str] = None
 token_expiry: float = 0
 
+# ================= FASTAPI =================
+
+app = FastAPI(title="CAMS PAN Download API")
 
 # ================= MODELS =================
 
@@ -55,37 +73,12 @@ class PanRequest(BaseModel):
             datetime.strptime(v, "%d-%m-%Y")
             return v
         except ValueError:
-            raise ValueError("DOB must be DD-MM-YYYY")
+            raise ValueError("DOB must be in DD-MM-YYYY format")
 
-
-# ================= STARTUP =================
-
-@app.on_event("startup")
-def initialize_keys():
-    global ENC_DEC_KEY, IV_KEY
-
-    enc_key = os.getenv("ENC_DEC_KEY")
-    iv_key = os.getenv("IV_KEY")
-
-    if enc_key and iv_key:
-        try:
-            ENC_DEC_KEY = base64.b64decode(enc_key)
-            IV_KEY = base64.b64decode(iv_key)
-        except Exception:
-            print("Invalid encryption keys configured")
-    else:
-        print("Encryption keys not set yet")
-
-
-def validate_env():
-    if not all([CLIENT_CODE, CLIENT_ID, SECRET_KEY, API_KEY, ENC_DEC_KEY, IV_KEY]):
-        raise HTTPException(status_code=500, detail="Server configuration error")
-
-
-# ================= ENCRYPTION =================
+# ================= AES ENCRYPTION =================
 
 def encrypt_payload(payload: dict) -> str:
-    data = json.dumps(payload).encode()
+    data = json.dumps(payload).encode("utf-8")
 
     padder = padding.PKCS7(128).padder()
     padded = padder.update(data) + padder.finalize()
@@ -99,7 +92,7 @@ def encrypt_payload(payload: dict) -> str:
     encryptor = cipher.encryptor()
     encrypted = encryptor.update(padded) + encryptor.finalize()
 
-    return base64.b64encode(encrypted).decode()
+    return base64.b64encode(encrypted).decode("utf-8")
 
 
 def decrypt_payload(data: str) -> dict:
@@ -117,10 +110,9 @@ def decrypt_payload(data: str) -> dict:
     unpadder = padding.PKCS7(128).unpadder()
     decrypted = unpadder.update(padded) + unpadder.finalize()
 
-    return json.loads(decrypted.decode())
+    return json.loads(decrypted.decode("utf-8"))
 
-
-# ================= TOKEN =================
+# ================= TOKEN FUNCTION =================
 
 def get_token():
     global cached_token, token_expiry
@@ -128,13 +120,15 @@ def get_token():
     if cached_token and time.time() < token_expiry:
         return cached_token
 
+    payload = {
+        "clientCode": CLIENT_CODE,
+        "grantType": "client_credentials",
+        "scope": "KYC"
+    }
+
     response = requests.post(
         TOKEN_URL,
-        json={
-            "clientCode": CLIENT_CODE,
-            "grantType": "client_credentials",
-            "scope": "KYC"
-        },
+        json=payload,
         auth=(CLIENT_ID, SECRET_KEY),
         timeout=15
     )
@@ -142,72 +136,91 @@ def get_token():
     response.raise_for_status()
     data = response.json()
 
+    if data.get("returnCode") not in (None, "0"):
+        raise Exception(data.get("returnMsg", "Token error"))
+
     token = data.get("accessToken")
     if not token:
         raise Exception("Token not returned")
 
     token_expiry = time.time() + (18 * 60)
     cached_token = token
-    return token
 
+    return token
 
 # ================= PAN DOWNLOAD =================
 
-def pan_download(pan: str, dob: str):
+def pan_download(pan: str, dob: str) -> dict:
     token = get_token()
 
-    encrypted = encrypt_payload({
-        "PAN": [{"pan": pan, "dob": dob}],
+    payload = {
+        "PAN": [{
+            "pan": pan,
+            "dob": dob
+        }],
         "sign_required": "N"
-    })
+    }
+
+    encrypted = encrypt_payload(payload)
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "ClientId": CLIENT_ID,
+        "Content-Type": "application/json"
+    }
 
     response = requests.post(
         PAN_DOWNLOAD_URL,
         json={"data": encrypted},
-        headers={
-            "Authorization": f"Bearer {token}",
-            "ClientId": CLIENT_ID,
-            "Content-Type": "application/json"
-        },
+        headers=headers,
         timeout=20
     )
 
     if response.status_code == 401:
         global cached_token
         cached_token = None
-        return pan_download(pan, dob)
+        token = get_token()
+        headers["Authorization"] = f"Bearer {token}"
+
+        response = requests.post(
+            PAN_DOWNLOAD_URL,
+            json={"data": encrypted},
+            headers=headers,
+            timeout=20
+        )
 
     response.raise_for_status()
-
     response_json = response.json()
+
     if "data" not in response_json:
         raise Exception("Invalid response from CAMS")
 
     return decrypt_payload(response_json["data"])
 
-
 # ================= ROUTES =================
 
 @app.post("/pan-download")
-def pan_download_api(request: PanRequest, x_api_key: str = Header(None)):
-    validate_env()
-
+def pan_download_api(
+    request: PanRequest,
+    x_api_key: str = Header(None)
+):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    result = pan_download(request.pan, request.dob)
-
-    return {
-        "success": True,
-        "pan": request.pan,
-        "data": result
-    }
+    try:
+        result = pan_download(request.pan, request.dob)
+        return {
+            "success": True,
+            "pan": request.pan,
+            "data": result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/")
 def health():
     return {"status": "CAMS PAN Download API running"}
-
 
 # ================= LOCAL RUN =================
 
