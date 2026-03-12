@@ -295,21 +295,28 @@ def pan_download_api(request: PanRequest, x_api_key: str = Header(None)):
 
     try:
 
-        pan_data = result.get("PAN", [])[0]
+        kyc_list = result.get("kycData", [])
 
-        status_code = str(pan_data.get("kycStatus", "")).strip()
+        if not kyc_list:
+            raise Exception("No KYC data returned")
+
+        pan_data = kyc_list[0]
+
+        status_code = str(pan_data.get("status", "")).strip()
+
+        if not status_code:
+            raise Exception("Missing KYC status")
 
     except Exception:
         raise HTTPException(status_code=500, detail="Invalid CAMS response")
 
     status_desc = KYC_STATUS_MAP.get(status_code, "UNKNOWN")
 
-
     # ================= SUCCESS =================
 
-    if status_code in ["02", "12"]:
+    if status_code in ["02", "07", "12", "22"]:
 
-        xml_data = pan_data.get("kycXml", "")
+        xml_data = pan_data.get("signature", "")
 
         if xml_data:
 
@@ -326,7 +333,6 @@ def pan_download_api(request: PanRequest, x_api_key: str = Header(None)):
             "data": pan_data
         }
 
-
     # ================= NOT AVAILABLE =================
 
     if status_code == "05":
@@ -338,7 +344,6 @@ def pan_download_api(request: PanRequest, x_api_key: str = Header(None)):
             "message": "PAN record not available in KRA"
         }
 
-
     # ================= REJECTED =================
 
     if status_code in ["04", "14"]:
@@ -349,7 +354,6 @@ def pan_download_api(request: PanRequest, x_api_key: str = Header(None)):
             "status": "KYC_REJECTED",
             "message": "KYC rejected by KRA"
         }
-
 
     # ================= OTHER STATES =================
 
