@@ -4,7 +4,6 @@ import json
 import base64
 import time
 import requests
-import smtplib
 
 from datetime import datetime
 from typing import Optional
@@ -15,10 +14,6 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
 from dotenv import load_dotenv
-
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
 
 
 # ================= INIT =================
@@ -42,15 +37,6 @@ cached_token: Optional[str] = None
 token_expiry: float = 0
 
 
-# ================= SMTP =================
-
-SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASS = os.getenv("SMTP_PASS")
-EMAIL_TO = os.getenv("EMAIL_TO")
-
-
 # ================= STATUS MAP =================
 
 KYC_STATUS_MAP = {
@@ -68,8 +54,10 @@ KYC_STATUS_MAP = {
     "22": "MUTUAL_FUND_VERIFIED"
 }
 
+VERIFIED_CODES = ["02", "07", "12", "22"]
 
-# ================= MODELS =================
+
+# ================= REQUEST MODEL =================
 
 class PanRequest(BaseModel):
     pan: str
@@ -79,16 +67,13 @@ class PanRequest(BaseModel):
     @classmethod
     def validate_pan(cls, v):
         v = v.strip().upper()
-
         if not re.match(r"^[A-Z]{5}[0-9]{4}[A-Z]$", v):
             raise ValueError("Invalid PAN format")
-
         return v
 
     @field_validator("dob")
     @classmethod
     def validate_dob(cls, v):
-
         try:
             datetime.strptime(v, "%d-%m-%Y")
             return v
@@ -106,26 +91,11 @@ def initialize_keys():
     enc_key = os.getenv("ENC_DEC_KEY")
     iv_key = os.getenv("IV_KEY")
 
-    if enc_key and iv_key:
+    if not enc_key or not iv_key:
+        raise Exception("Encryption keys missing")
 
-        ENC_DEC_KEY = base64.b64decode(enc_key)
-        IV_KEY = base64.b64decode(iv_key)
-
-    else:
-        print("Encryption keys missing")
-
-
-def validate_env():
-
-    if not all([
-        CLIENT_CODE,
-        CLIENT_ID,
-        SECRET_KEY,
-        API_KEY,
-        ENC_DEC_KEY,
-        IV_KEY
-    ]):
-        raise HTTPException(status_code=500, detail="Server configuration error")
+    ENC_DEC_KEY = base64.b64decode(enc_key)
+    IV_KEY = base64.b64decode(iv_key)
 
 
 # ================= ENCRYPTION =================
@@ -171,40 +141,6 @@ def decrypt_payload(data: str) -> dict:
     return json.loads(decrypted.decode())
 
 
-# ================= EMAIL XML =================
-
-def send_xml_email(pan: str, xml_data: str):
-
-    if not SMTP_HOST or not EMAIL_TO:
-        return
-
-    msg = MIMEMultipart()
-
-    msg["From"] = SMTP_USER
-    msg["To"] = EMAIL_TO
-    msg["Subject"] = f"CAMS KYC XML {pan}"
-
-    msg.attach(MIMEText("CAMS KYC XML attached.", "plain"))
-
-    attachment = MIMEApplication(xml_data.encode("utf-8"))
-
-    attachment.add_header(
-        "Content-Disposition",
-        "attachment",
-        filename=f"{pan}_kyc.xml"
-    )
-
-    msg.attach(attachment)
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-
-        server.starttls()
-
-        server.login(SMTP_USER, SMTP_PASS)
-
-        server.send_message(msg)
-
-
 # ================= TOKEN =================
 
 def get_token():
@@ -241,7 +177,7 @@ def get_token():
     return token
 
 
-# ================= PAN DOWNLOAD =================
+# ================= CAMS PAN DOWNLOAD =================
 
 def pan_download(pan: str, dob: str):
 
@@ -266,7 +202,6 @@ def pan_download(pan: str, dob: str):
     if response.status_code == 401:
 
         global cached_token
-
         cached_token = None
 
         return pan_download(pan, dob)
@@ -281,87 +216,55 @@ def pan_download(pan: str, dob: str):
     return decrypt_payload(response_json["data"])
 
 
-# ================= ROUTE =================
+# ================= STATUS EXTRACTION =================
+
+def extract_pan_record(result):
+
+    if "kycData" in result and result["kycData"]:
+        return result["kycData"][0]
+
+    if "verifyPanResponseList" in result and result["verifyPanResponseList"]:
+        return result["verifyPanResponseList"][0]
+
+    if "PAN" in result and result["PAN"]:
+        return result["PAN"][0]
+
+    return None
+
+
+# ================= API ROUTE =================
 
 @app.post("/pan-download")
 def pan_download_api(request: PanRequest, x_api_key: str = Header(None)):
-
-    validate_env()
 
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     result = pan_download(request.pan, request.dob)
 
-    try:
+    pan_data = extract_pan_record(result)
 
-        kyc_list = result.get("kycData", [])
-
-        if not kyc_list:
-            raise Exception("No KYC data returned")
-
-        pan_data = kyc_list[0]
-
-        status_code = str(pan_data.get("status", "")).strip()
-
-        if not status_code:
-            raise Exception("Missing KYC status")
-
-    except Exception:
-        raise HTTPException(status_code=500, detail="Invalid CAMS response")
-
-    status_desc = KYC_STATUS_MAP.get(status_code, "UNKNOWN")
-
-    # ================= SUCCESS =================
-
-    if status_code in ["02", "07", "12", "22"]:
-
-        xml_data = pan_data.get("signature", "")
-
-        if xml_data:
-
-            try:
-                send_xml_email(request.pan, xml_data)
-            except Exception as e:
-                print("Email error:", str(e))
-
-        return {
-            "success": True,
-            "status_code": status_code,
-            "status": status_desc,
-            "pan": request.pan,
-            "data": pan_data
-        }
-
-    # ================= NOT AVAILABLE =================
-
-    if status_code == "05":
-
+    if not pan_data:
         return {
             "success": False,
-            "status_code": "05",
-            "status": "NOT_AVAILABLE",
-            "message": "PAN record not available in KRA"
+            "status_code": None,
+            "data": result
         }
 
-    # ================= REJECTED =================
-
-    if status_code in ["04", "14"]:
-
-        return {
-            "success": False,
-            "status_code": status_code,
-            "status": "KYC_REJECTED",
-            "message": "KYC rejected by KRA"
-        }
-
-    # ================= OTHER STATES =================
+    status_code = str(
+        pan_data.get("status")
+        or pan_data.get("updateStatus")
+        or pan_data.get("kycStatus")
+        or pan_data.get("camskra")
+        or pan_data.get("compStatus")
+        or ""
+    ).strip()
 
     return {
-        "success": False,
-        "status_code": status_code,
-        "status": status_desc,
-        "message": f"KYC status: {status_desc}"
+        "success": status_code in VERIFIED_CODES,
+        "status_code": status_code if status_code else None,
+        "pan": request.pan,
+        "data": result
     }
 
 
@@ -369,18 +272,4 @@ def pan_download_api(request: PanRequest, x_api_key: str = Header(None)):
 
 @app.get("/")
 def health():
-
-    return {
-        "status": "CAMS PAN Download API running"
-    }
-
-
-# ================= LOCAL RUN =================
-
-if __name__ == "__main__":
-
-    import uvicorn
-
-    port = int(os.environ.get("PORT", 8080))
-
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    return {"status": "CAMS PAN Download API running"}
